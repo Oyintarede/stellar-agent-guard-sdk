@@ -26,7 +26,7 @@
  */
 import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
 import { concatBytes, sha256Hex, utf8Bytes } from "./hash.ts";
-import { GuardError, InvalidInputError, SimulationError } from "./errors.ts";
+import { GuardError, GuardUndeterminedError, InvalidInputError, SimulationError } from "./errors.ts";
 import { enforceCall, RpcTimeoutError, timeoutOutcome, withRpcAbort } from "./invoke.ts";
 import {
   DEFAULT_RPC_TIMEOUT_MS,
@@ -48,14 +48,12 @@ import { resolveLogger, type GuardLogger, type GuardLoggerInput } from "./logger
 import { parseSimulationResourceFee, toAgentSigner } from "./tx.ts";
 import type { AgentSigner, ContractCall } from "./tx.ts";
 import { systemClock, type Clock } from "./clock.ts";
+import { withResolvedServer, type WithRpcTransport } from "./transport.ts";
 
 /**
- * Re-exported from `errors.ts` for the existing import path. Thrown
- * synchronously when a ContractCall has invalid shape or types before any RPC
- * round-trip is attempted, distinguishing programmer errors from policy
- * outcomes (blocked decisions).
+ * Re-exported from `errors.ts` for the existing import path.
  */
-export { InvalidInputError };
+export { GuardUndeterminedError, InvalidInputError };
 
 /**
  * Validate a ContractCall's input shape before RPC dispatch.
@@ -154,22 +152,10 @@ export function validateContractCall(call: ContractCall): void {
 /**
  * Thrown when enforcement could not reach a decision.
  *
- * Deliberately not a `GuardBlockedError`: reporting "the guard refused this"
- * when the guard never ruled would be a false claim about the security
- * boundary, which is the one thing an operator must be able to trust.
+ * @deprecated Use `GuardUndeterminedError`. Kept as an alias for backward compatibility.
  */
-export class PreFlightUndeterminedError extends SimulationError {
-  readonly detail: string;
-
-  constructor(detail: string, options: { cause?: unknown } = {}) {
-    super(`stellar-agent-guard could not determine this action's status\n${detail}`, {
-      stage: "preflight",
-      ...(options.cause === undefined ? {} : { cause: options.cause }),
-    });
-    this.name = "PreFlightUndeterminedError";
-    this.detail = detail;
-  }
-}
+export const PreFlightUndeterminedError = GuardUndeterminedError;
+export type PreFlightUndeterminedError = GuardUndeterminedError;
 
 export type PreFlightDecision =
   | {
@@ -420,6 +406,12 @@ export interface PreFlightCacheOptions {
   maxEntries?: number;
 }
 
+/**
+ * What `new PreFlightInterceptor()` accepts: `PreFlightConfig` with the shared
+ * `{ server? | url? }` transport (issue #117) in place of a mandatory `server`.
+ */
+export type PreFlightConfigInput = WithRpcTransport<PreFlightConfig>;
+
 export interface PreFlightConfig {
   server: rpc.Server;
   networkPassphrase: string;
@@ -569,7 +561,9 @@ export class PreFlightInterceptor {
   private _misses = 0;
   private _invalidations = 0;
 
-  constructor(config: PreFlightConfig) {
+  constructor(input: PreFlightConfigInput) {
+    // Shared transport (issue #117): exactly one of `server` or `url`.
+    const config = withResolvedServer<PreFlightConfig>(input);
     this.config = config;
     this.cacheOptions = config.cache;
     this.clock = config.clock ?? systemClock;
@@ -1250,12 +1244,30 @@ export class PreFlightInterceptor {
   /**
    * Convenience for adapters that want a throw-on-refusal shape.
    *
-   * Throws `GuardBlockedError` for both `blocked` and `undetermined` — an
-   * interceptor that returned happily on `undetermined` would hand an agent a
-   * green light the chain never gave.
+   * Throws `GuardBlockedError` on `blocked`, and `GuardUndeterminedError` on
+   * `undetermined` or transport failures — an interceptor that returned happily
+   * on `undetermined` would hand an agent a green light the chain never gave.
+   * Never lets a raw non-Guard error escape.
    */
   async assertAllowed(call: ContractCall): Promise<PreFlightDecision & { allowed: true }> {
-    const decision = await this.check(call);
+    let decision: PreFlightDecision;
+    try {
+      decision = await this.check(call);
+    } catch (cause) {
+      if (cause instanceof InvalidInputError) {
+        throw cause;
+      }
+      if (cause instanceof GuardBlockedError || cause instanceof GuardUndeterminedError) {
+        throw cause;
+      }
+      const message = cause instanceof Error ? cause.message : String(cause);
+      throw new GuardUndeterminedError(message, {
+        stage: "preflight",
+        cause,
+        detail: message,
+      });
+    }
+
     if (decision.allowed) return decision;
     if (decision.kind === "blocked") {
       const rawEvent = decision.diagnosticEvents?.[0];
@@ -1267,20 +1279,42 @@ export class PreFlightInterceptor {
         rawEvent,
       });
     }
-    throw new PreFlightUndeterminedError(decision.detail, { cause: decision.error });
+    throw new GuardUndeterminedError(decision.detail, {
+      stage: "preflight",
+      cause: decision.error,
+      detail: decision.detail,
+    });
   }
 
   /**
    * Convenience for adapters that want a throw-on-refusal shape for batches.
    *
    * Throws `GuardBlockedError` if any call in the batch is blocked, or
-   * `PreFlightUndeterminedError` if any call is undetermined.
+   * `GuardUndeterminedError` if any call is undetermined or a transport error occurs.
+   * Never lets a raw non-Guard error escape.
    */
   async assertBatchAllowed(
     calls: ContractCall[],
     options?: CheckBatchOptions,
   ): Promise<PreFlightBatchDecision & { admissible: true }> {
-    const decision = await this.checkBatch(calls, options);
+    let decision: PreFlightBatchDecision;
+    try {
+      decision = await this.checkBatch(calls, options);
+    } catch (cause) {
+      if (cause instanceof InvalidInputError) {
+        throw cause;
+      }
+      if (cause instanceof GuardBlockedError || cause instanceof GuardUndeterminedError) {
+        throw cause;
+      }
+      const message = cause instanceof Error ? cause.message : String(cause);
+      throw new GuardUndeterminedError(message, {
+        stage: "preflight",
+        cause,
+        detail: message,
+      });
+    }
+
     if (decision.admissible) return decision as PreFlightBatchDecision & { admissible: true };
     for (const verdict of decision.verdicts) {
       if (verdict.kind === "blocked") {
@@ -1291,15 +1325,18 @@ export class PreFlightInterceptor {
         });
       }
       if (verdict.kind === "undetermined") {
-        throw new PreFlightUndeterminedError(verdict.detail, {
+        throw new GuardUndeterminedError(verdict.detail, {
+          stage: "preflight",
           ...(verdict.error === undefined ? {} : { cause: verdict.error }),
+          detail: verdict.detail,
         });
       }
     }
-    throw new PreFlightUndeterminedError(
+    throw new GuardUndeterminedError(
       decision.kind === "undetermined" && decision.detail !== undefined
         ? decision.detail
         : "batch refused by guardrails",
+      { stage: "preflight" },
     );
   }
 
@@ -1318,13 +1355,13 @@ export class PreFlightInterceptor {
 }
 
 /** One-shot form, for callers that do not want to hold an interceptor. */
-export function preflight(config: PreFlightConfig, call: ContractCall): Promise<PreFlightDecision> {
+export function preflight(config: PreFlightConfigInput, call: ContractCall): Promise<PreFlightDecision> {
   return new PreFlightInterceptor(config).check(call);
 }
 
 /** One-shot form for batch pre-flight checks. */
 export function preflightBatch(
-  config: PreFlightConfig,
+  config: PreFlightConfigInput,
   calls: ContractCall[],
   options?: CheckBatchOptions,
 ): Promise<PreFlightBatchDecision> {
